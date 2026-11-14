@@ -1,0 +1,7 @@
+# 部品（各自のPCで start.command が自動インストール）
+.venv/
+__pycache__/
+# 処理した動画・画像（個人情報を含むので絶対に共有しない）
+work/
+*_masked.*
+.DS_Store

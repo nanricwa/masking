@@ -1,0 +1,1 @@
+{"version":"0.0.1","configurations":[{"name":"masking","runtimeExecutable":"bash","runtimeArgs":["-c","NO_BROWSER=1 .venv/bin/python app.py"],"port":8765}]}

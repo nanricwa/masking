@@ -135,18 +135,31 @@ LABELS = [
     "住所", "ご住所", "所在地", "電話番号", "電話", "TEL", "携帯", "メールアドレス", "メール",
     "E-mail", "Email", "生年月日", "誕生日", "口座番号", "カード番号", "会員番号", "顧客番号",
     "担当者", "ユーザー名", "アカウント名", "宛名", "差出人", "送信者", "宛先",
+    "パスワード", "暗証番号", "ログインID", "備考", "備考欄", "会員情報", "会員名", "顧客名", "顧客情報", "お客様名", "お客様情報",
+    "申込者", "申込者名", "購入者", "購入者名", "契約者", "契約者名", "ニックネーム", "LINE名",
 ]
+# 表の列見出しとして使われるもの（この下の列をまとめて隠す）
+COLUMN_HEADERS = {"氏名", "お名前", "名前", "会員情報", "会員名", "顧客名", "顧客情報", "お客様名", "お客様情報",
+                  "申込者", "申込者名", "購入者", "購入者名", "契約者", "契約者名", "メールアドレス", "メール",
+                  "電話番号", "住所", "ユーザー名", "アカウント名", "ニックネーム", "LINE名", "担当者", "宛先", "差出人", "送信者"}
 LABEL_RE = re.compile(
-    r"^\s*[【\[（(]?\s*(" + "|".join(sorted(map(re.escape, LABELS), key=len, reverse=True)) + r")\s*[】\]）)]?\s*(?:[:：]\s*|\s+|$)",
+    r"^\s*[【\[（(]?\s*(" + "|".join(sorted(map(re.escape, LABELS), key=len, reverse=True)) + r")\s*[*＊※]?\s*[】\]）)]?\s*(?:[:：]\s*|\s+|$)",
     re.IGNORECASE,
 )
+
+
+# OCRが日本語の漢字を中国の簡体字で読むことがあるので直す（例: 会员情報 → 会員情報）
+SIMPLIFIED = str.maketrans({"员": "員", "话": "話", "电": "電", "邮": "郵", "码": "碼", "账": "帳",
+                            "户": "戸", "机": "機", "号": "号", "称": "称", "务": "務", "关": "関",
+                            "联": "聯", "络": "絡", "约": "約", "购": "購", "买": "買", "顾": "顧",
+                            "详": "詳", "细": "細", "设": "設", "页": "頁", "姓": "姓", "现": "現"})
 
 
 def _normalize(text: str):
     """全角→半角などを揃え、元の文字位置との対応表も作る"""
     out, idx = [], []
     for i, ch in enumerate(text):
-        n = unicodedata.normalize("NFKC", ch)
+        n = unicodedata.normalize("NFKC", ch).translate(SIMPLIFIED)
         for c in n:
             out.append(c)
             idx.append(i)
@@ -160,6 +173,17 @@ HONORIFIC_STOP = {"客", "お客", "皆", "皆々", "各位", "担当", "ご担�
 def _is_common_word(with_prev: str, name: str) -> bool:
     name = name.strip()
     return name in HONORIFIC_STOP or with_prev.strip() in HONORIFIC_STOP or name.endswith(("客", "者", "員"))
+
+
+DATE_RE = re.compile(r"(?:19|20)\d{2}\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}|\d{1,2}\s*:\s*\d{2}")
+
+
+def _looks_like_datetime(norm: str, s: int, e: int) -> bool:
+    """2025-04-12 12:07:39 のような日時を電話番号などと間違えない"""
+    for m in DATE_RE.finditer(norm):
+        if m.start() < e and m.end() > s:
+            return True
+    return False
 
 
 def _span_back(idx, s, e, n_orig):
@@ -214,6 +238,8 @@ def detect(lines: list[Line], cats: set[str], words: list[str]) -> list[Hit]:
                         continue
                     if cat == "honorific" and _is_common_word(norm[max(0, s - 1):e], norm[s:e]):
                         continue
+                    if cat in ("phone", "postal", "card") and _looks_like_datetime(norm, s, e):
+                        continue
                     a, b = _span_back(idx, s, e, len(ln.text))
                     hits.append(Hit(name, ln.text[a:b], ln.sub_box(a, b)))
 
@@ -230,29 +256,55 @@ def detect(lines: list[Line], cats: set[str], words: list[str]) -> list[Hit]:
         if words:
             hits.extend(_custom_hits(ln, words))
 
-    # 見出しの右（同じ高さ）の欄を優先、なければ真下の欄を隠す
+    # 見出しだけの行のまわりを隠す
+    #  ・表の列見出し（下に同じ列の行が続く）→ その列を下までまとめて隠す
+    #  ・フォームの見出し → 同じ行の右側の欄（なければ真下の欄）を隠す
+    def is_label(ln):
+        return bool(LABEL_RE.match(_normalize(ln.text)[0]))
+
     for lab in label_only:
         lx1, ly1, lx2, ly2 = lab.box
         lh = max(ly2 - ly1, 8)
-        right, rd, below, bd = None, 1e9, None, 1e9
-        for ln in lines:
-            if ln is lab:
-                continue
+        name = LABEL_RE.match(_normalize(lab.text)[0]).group(1)
+
+        # 表の列: 見出しと左端がそろって、すき間なく下に並ぶ行
+        col, bottom = [], ly2
+        for ln in sorted((l for l in lines if l.box[1] >= ly2 - 2), key=lambda l: l.box[1]):
             x1, y1, x2, y2 = ln.box
-            v_overlap = min(ly2, y2) - max(ly1, y1)
-            h_overlap = min(lx2, x2) - max(lx1, x1)
-            if v_overlap > lh * 0.4 and x1 >= lx2 - 4 and x1 - lx2 < lh * 12 and x1 - lx2 < rd:
-                right, rd = ln, x1 - lx2
-            elif h_overlap > 0 and y1 >= ly2 - 2 and y1 - ly2 < lh * 1.5 and y1 - ly2 < bd:
-                below, bd = ln, y1 - ly2
-        for best in (right, below):
-            if best is None:
+            if abs(x1 - lx1) > lh * 1.5 or ln is lab:
                 continue
-            if LABEL_RE.match(_normalize(best.text)[0]):  # 隣も見出しなら隠さない
-                continue
-            name = LABEL_RE.match(_normalize(lab.text)[0]).group(1)
-            hits.append(Hit(f"「{name}」欄", best.text, best.box))
-            break
+            if y1 - bottom > lh * 2.5 or is_label(ln):
+                break
+            col.append(ln)
+            bottom = y2
+        # 表の見出し行なら、同じ高さの右側に他の見出しが3つ以上並んでいる
+        row_mates = sum(1 for l in lines if l is not lab and l.box[0] > lx2
+                        and abs((l.box[1] + l.box[3]) / 2 - (ly1 + ly2) / 2) <= lh * 0.6)
+        if name in COLUMN_HEADERS and len(col) >= 2 and row_mates >= 3:
+            hits.extend(Hit(f"「{name}」列", ln.text, ln.box) for ln in col)
+            continue
+
+        # フォーム: 同じ行（見出しの高さ±1行）で右にある欄
+        cy = (ly1 + ly2) / 2
+        right = [ln for ln in lines if ln is not lab
+                 and ln.box[0] >= lx2 - 4 and ln.box[0] - lx2 < lh * 12
+                 and abs((ln.box[1] + ln.box[3]) / 2 - cy) <= lh * 0.9
+                 and not is_label(ln)]
+        if name in ("パスワード", "暗証番号"):
+            # 入力中のパスワードは選択色などで文字として読めないことがあるので、行の右側を丸ごと隠す
+            xs = [ln.box[2] for ln in right] + [lx2 + lh * 20]
+            ys1 = [ln.box[1] for ln in right] + [ly1 - lh // 2]
+            ys2 = [ln.box[3] for ln in right] + [ly2 + lh // 2]
+            hits.append(Hit(f"「{name}」欄", "（パスワード欄）", (lx2 + lh // 2, min(ys1), max(xs), max(ys2))))
+            continue
+        if right:
+            hits.extend(Hit(f"「{name}」欄", ln.text, ln.box) for ln in right)
+            continue
+        below = [ln for ln in lines if ln is not lab
+                 and min(lx2, ln.box[2]) - max(lx1, ln.box[0]) > 0
+                 and 0 <= ln.box[1] - ly2 + 2 < lh * 1.5]
+        if below and not is_label(below[0]):
+            hits.append(Hit(f"「{name}」欄", below[0].text, below[0].box))
 
     return hits
 

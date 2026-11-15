@@ -5,3 +5,8 @@ __pycache__/
 work/
 *_masked.*
 .DS_Store
+# 実際の録画はリポジトリに入れない（サンプル以外）
+test/*
+!test/make_sample.py
+!test/sample.mp4
+!test/sample.png

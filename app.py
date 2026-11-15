@@ -154,6 +154,7 @@ table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}td,th{te
 <label><input type="checkbox" name="cats" value="postal" checked> 郵便番号</label>
 <label><input type="checkbox" name="cats" value="card" checked> カード・マイナンバー等の長い番号</label>
 <label><input type="checkbox" name="cats" value="honorific" checked> 「〇〇様」「〇〇さん」の名前</label>
+<label><input type="checkbox" name="cats" value="name" checked> 一覧表などに並ぶ人の名前</label>
 <label><input type="checkbox" name="cats" value="label" checked> 「氏名」「住所」などの欄の中身</label>
 </div>
 <h2 style="margin-top:16px">必ず隠したい言葉（1行に1つ）</h2>

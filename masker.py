@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from surnames import SURNAMES
+
 # ---------------------------------------------------------------------------
 # 1. OCR（PaddleOCR PP-OCRv5 モデルを RapidOCR で実行。日本語・英語対応）
 # ---------------------------------------------------------------------------
@@ -112,8 +114,10 @@ PREFS = (
 PATTERNS = {
     "email": [("メールアドレス", r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]*", 0)],
     "phone": [
-        ("電話番号", rf"(?<!\d)(?:\+81{DASH}?|0)\d{{1,4}}{DASH}?\(?\d{{1,4}}\)?{DASH}?\d{{3,4}}(?!\d)", 0),
-        ("電話番号", r"(?<!\d)0[5789]0\d{8}(?!\d)", 0),
+        ("電話番号", rf"(?<![\d\-])(?:\+81{DASH}?|0)\d{{1,4}}{DASH}\(?\d{{1,4}}\)?{DASH}\d{{3,4}}(?![\d\-])", 0),
+        ("電話番号", rf"(?<![\d\-])0\d{{1,4}}\(\d{{1,4}}\)\d{{3,4}}(?![\d\-])", 0),
+        ("電話番号", r"(?<!\d)0\d{8,10}(?!\d)", 0),
+        ("電話番号", r"(?<![\d.])[789]0\d{8}(?![\d.])", 0),  # 表計算で先頭の0が消えた携帯番号
     ],
     "postal": [("郵便番号", rf"〒\s*\d{{3}}{DASH}?\d{{4}}|(?<![\d\-])\d{{3}}{DASH}\d{{4}}(?![\d\-])", 0)],
     "card": [
@@ -139,13 +143,78 @@ LABELS = [
     "申込者", "申込者名", "購入者", "購入者名", "契約者", "契約者名", "ニックネーム", "LINE名",
 ]
 # 表の列見出しとして使われるもの（この下の列をまとめて隠す）
-COLUMN_HEADERS = {"氏名", "お名前", "名前", "会員情報", "会員名", "顧客名", "顧客情報", "お客様名", "お客様情報",
+# 表の列見出しとしてだけ使うもの（フォームの見出しとしては使わない）
+COLUMN_ONLY = ["相手方", "相手先", "取引先", "署名者名", "受信者", "送付先", "依頼先名", "担当者名",
+               "アカウントID", "ユーザーID", "会員ID", "顧客ID", "ChatworkID", "LINE ID", "LINEID"]
+COLUMN_HEADERS = set(COLUMN_ONLY) | {"氏名", "お名前", "名前", "会員情報", "会員名", "顧客名", "顧客情報", "お客様名", "お客様情報",
                   "申込者", "申込者名", "購入者", "購入者名", "契約者", "契約者名", "メールアドレス", "メール",
                   "電話番号", "住所", "ユーザー名", "アカウント名", "ニックネーム", "LINE名", "担当者", "宛先", "差出人", "送信者"}
-LABEL_RE = re.compile(
-    r"^\s*[【\[（(]?\s*(" + "|".join(sorted(map(re.escape, LABELS), key=len, reverse=True)) + r")\s*[*＊※]?\s*[】\]）)]?\s*(?:[:：]\s*|\s+|$)",
-    re.IGNORECASE,
-)
+def _label_re(words):
+    return re.compile(
+        r"^\s*[【\[（(]?\s*(" + "|".join(sorted(map(re.escape, words), key=len, reverse=True))
+        + r")\s*[*＊※]?\s*[】\]）)]?\s*(?:[:：]\s*|\s+|$)",
+        re.IGNORECASE,
+    )
+
+
+LABEL_RE = _label_re(LABELS)
+HEADER_ONLY_RE = _label_re(COLUMN_ONLY)
+
+# 画面の部品によく出る言葉。見出しの右にあっても「中身」とはみなさない・覚えない
+UI_WORDS = {"必須", "任意", "必須項目", "入力必須", "*", "※", "?", "？", "編集", "変更", "削除", "選択", "設定",
+            "設定する", "許可する", "追加", "保存", "キャンセル", "確認", "表示", "非表示", "検索", "送信",
+            "署名", "署名者", "署名順", "署名方法", "署名完了", "依頼先", "送信先", "自社署名者", "送信担当者",
+            "受領者", "宛先", "完了", "未完了", "なし", "あり", "未設定", "未入力", "コメント", "メール言語",
+            "日本語", "English", "必須入力", "テキスト", "日付", "署名", "印鑑", "チェックボックス", "ステータス", "契約日", "文書名", "No", "ON", "OFF"}
+
+# 名前の後ろにはまず来ない（UIの言葉の終わり方）
+_NOT_NAME_TAIL = ("管理", "一覧", "設定", "情報", "書", "者", "先", "日", "方法", "名", "欄", "番号", "画面", "履歴",
+                  "完了", "依頼", "確認", "送信", "登録", "変更", "削除", "検索", "表示", "選択", "入力", "機能",
+                  "期", "会", "部", "課", "社", "店", "所", "局", "室", "様", "殿", "中", "済", "用", "式", "版", "型")
+_KANJI = r"一-龥々〆ヶ"
+_NAME_CHARS = re.compile(rf"^[{_KANJI}ぁ-んァ-ヶー]+$")
+
+
+def _name_like(text: str) -> int:
+    """人の名前らしさ: 2=よくある名字で始まる名前 / 1=「名字 名前」の形 / 0=違う"""
+    norm = unicodedata.normalize("NFKC", text).translate(SIMPLIFIED).strip()
+    parts = norm.split()
+    flat = "".join(parts)
+    if not (2 <= len(flat) <= 8) or not _NAME_CHARS.match(flat):
+        return 0
+    if flat in UI_WORDS or flat in COLUMN_HEADERS or flat in LABELS or flat.endswith(_NOT_NAME_TAIL):
+        return 0
+    if re.search(r"[様殿都道府県市区町村]|さん|より|から|です|ます|して|する|った", flat):
+        return 0
+    if re.fullmatch(r"[ぁ-ん]+", flat) and len(parts) < 2:  # ひらがなだけの1語は普通の言葉が多い
+        return 0
+    for n in (3, 2, 1):
+        if n == 1 and len(flat) > 4:  # 1文字の名字（森・林など）は短い名前だけ
+            continue
+        if len(flat) > n and flat[:n] in SURNAMES and re.match(rf"[{_KANJI}]", flat[n]):
+            return 2
+    if len(parts) == 2 and all(1 <= len(x) <= 5 for x in parts):
+        return 1
+    return 0
+
+
+_ALL_HEADS = sorted(set(LABELS) | COLUMN_HEADERS, key=len, reverse=True)
+
+
+def _fix_label(norm: str) -> str:
+    """OCRの1文字読み間違い（例: 電話蛋号）を見出しとして直す。4文字以上の見出しだけ"""
+    t = norm.strip()
+    if 4 <= len(t) <= 10 and t not in _ALL_HEADS:
+        for w in _ALL_HEADS:
+            if len(w) == len(t) >= 4 and sum(a != b for a, b in zip(w, t)) == 1:
+                return w
+    return norm
+
+
+def _is_ui(text: str) -> bool:
+    t = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+    t2 = re.sub(r"^[A-Za-z\W]{1,2}(?=[ぁ-んァ-ヶ一-龥])", "", t)  # 先頭のアイコン（「Tテキスト」の T など）
+    return any(x in UI_WORDS or x in LABELS or x in COLUMN_HEADERS for x in (t, t2))
 
 
 # OCRが日本語の漢字を中国の簡体字で読むことがあるので直す（例: 会员情報 → 会員情報）
@@ -224,10 +293,119 @@ def _custom_hits(line: Line, words: list[str]) -> list[Hit]:
     return hits
 
 
+_SEG_RE = re.compile(rf"[{_KANJI}ぁ-んァ-ヶー]+(?:[ 　][{_KANJI}ぁ-んァ-ヶー]+)?|\d[\d/\-:.,]*|[^\s{_KANJI}ぁ-んァ-ヶー\d]+")
+
+
+def _segments(ln: Line) -> list[Line]:
+    """1行に読まれた文字を「日本語」「数字」「英字・記号」のかたまりに分ける
+    （表で隣のセルがつながって読まれた「2022/05/23山田太郎」なども、名前の部分だけ扱える）"""
+    segs = [m for m in _SEG_RE.finditer(ln.text) if m.group().strip()]
+    if len(segs) <= 1:
+        return [ln]
+    out = []
+    for m in segs:  # 文字位置からの切り出しは少しずれるので、左右に少し余裕を持たせる
+        x1, y1, x2, y2 = ln.sub_box(m.start(), m.end())
+        pad = (y2 - y1) * 0.35
+        out.append(Line(m.group(), (int(max(ln.box[0], x1 - pad)), int(y1), int(min(ln.box[2], x2 + pad)), int(y2)), []))
+    return out
+
+
+def _column_below(header: Line, cells: list[Line], row: list[Line], is_label) -> list[Line]:
+    """表の列見出しの真下に並ぶセル。各セルは、横位置がいちばん重なる見出しの列に属するとみなす"""
+    hx1, hy1, hx2, hy2 = header.box
+    lh = max(hy2 - hy1, 8)
+
+    def owner(c):
+        cx1, _, cx2, _ = c.box
+        best = max(row, key=lambda h: (min(cx2, h.box[2]) - max(cx1, h.box[0]),
+                                       -abs((cx1 + cx2) / 2 - (h.box[0] + h.box[2]) / 2)))
+        return best
+
+    col, bottom = [], hy2
+    for c in sorted((c for c in cells if c.box[1] >= hy2 - 2), key=lambda c: c.box[1]):
+        x1, y1, x2, y2 = c.box
+        if min(x2, hx2 + lh) - max(x1, hx1 - lh) <= 0:
+            continue
+        if y1 - bottom > lh * 2.5:
+            break
+        if owner(c) is not header:
+            continue
+        if is_label(c):
+            break
+        col.append(c)
+        bottom = y2
+    return col
+
+
+def _fits_header(name: str, text: str) -> bool:
+    """その列見出しの中身としてありえる文字か（例: メール列なのに日本語の文章、などは除く）"""
+    t = unicodedata.normalize("NFKC", text).strip()
+    if not t or _is_ui(t):
+        return False
+    if "メール" in name:
+        return bool(re.search(r"[@A-Za-z0-9]", t)) and not re.search(rf"[{_KANJI}ぁ-ん]", t)
+    if "電話" in name:
+        return len(re.findall(r"\d", t)) >= 3
+    if "ID" in name.upper():
+        return bool(re.search(r"[A-Za-z0-9]", t))
+    if "住所" in name:
+        return len(t) <= 60
+    return len(t) <= 20 and not t.endswith(_NOT_NAME_TAIL)
+
+
+def _band(cells: list[Line]) -> tuple:
+    """列のセルをまとめた帯（読み取れなかった行もいっしょに隠すため）"""
+    return (min(c.box[0] for c in cells), min(c.box[1] for c in cells),
+            max(c.box[2] for c in cells), max(c.box[3] for c in cells))
+
+
+def _name_columns(cells: list[Line]) -> tuple[list[Line], list[tuple]]:
+    """名前が2つ以上、すき間なく縦に並んでいる列は、その並びの名前らしいセルをまとめて隠す"""
+    def nameish(c, sc):
+        if sc:
+            return True
+        flat = re.sub(r"\s+", "", unicodedata.normalize("NFKC", c.text))
+        return 1 <= len(flat) <= 8 and bool(_NAME_CHARS.match(flat)) and not _is_ui(flat) \
+            and not flat.endswith(_NOT_NAME_TAIL) and not flat.endswith(("タイプ", "ボタン", "メニュー", "リスト"))
+
+    scored = [(c, _name_like(c.text)) for c in cells]
+    out: set[int] = set()
+    done: set[int] = set()
+    bands: list[tuple] = []
+    for seed, ssc in scored:
+        if ssc != 2 or id(seed) in done:
+            continue
+        sx1, sy1, sx2, sy2 = seed.box
+        lh = max(sy2 - sy1, 8)
+        mates = sorted(((c, sc) for c, sc in scored if abs(c.box[0] - sx1) <= lh * 1.5), key=lambda t: t[0].box[1])
+        # 縦のかたまり（名前らしいセルが、すき間なく続く範囲）に分ける
+        runs, cur, prev = [], [], None
+        for c, sc in mates:
+            if not nameish(c, sc) or (prev is not None and c.box[1] - prev.box[3] > lh * 3.5):
+                if cur:
+                    runs.append(cur)
+                cur, prev = [], None
+                if not nameish(c, sc):
+                    continue
+            cur.append((c, sc))
+            prev = c
+        if cur:
+            runs.append(cur)
+        for run in runs:
+            if any(c is seed for c, _ in run):
+                done.update(id(c) for c, sc in run if sc == 2)
+                if sum(1 for _, sc in run if sc == 2) >= 2:
+                    out.update(id(c) for c, _ in run)
+                    bands.append(_band([c for c, _ in run]))
+    return [c for c in cells if id(c) in out], bands
+
+
 def detect(lines: list[Line], cats: set[str], words: list[str]) -> list[Hit]:
     hits: list[Hit] = []
     label_only: list[Line] = []
 
+    lines = [Line(_fix_label(_normalize(ln.text)[0]), ln.box, []) if _fix_label(_normalize(ln.text)[0]) != _normalize(ln.text)[0]
+             else ln for ln in lines]
     for ln in lines:
         norm, idx = _normalize(ln.text)
         for cat in cats:
@@ -238,6 +416,11 @@ def detect(lines: list[Line], cats: set[str], words: list[str]) -> list[Hit]:
                         continue
                     if cat == "honorific" and _is_common_word(norm[max(0, s - 1):e], norm[s:e]):
                         continue
+                    # 「盗用されまたは」→「盗用さん」のような読み間違い: さん・さまの後に文がそのまま続くものは除く
+                    if cat == "honorific" and norm[m.end() - 2:m.end()] in ("さん", "さま") \
+                            and re.match(r"[ぁ-ゖ]", norm[m.end():m.end() + 1]) \
+                            and norm[m.end()] not in "のにはがへともやね" and _name_like(norm[s:e]) != 2:
+                        continue
                     if cat in ("phone", "postal", "card") and _looks_like_datetime(norm, s, e):
                         continue
                     a, b = _span_back(idx, s, e, len(ln.text))
@@ -247,44 +430,55 @@ def detect(lines: list[Line], cats: set[str], words: list[str]) -> list[Hit]:
             m = LABEL_RE.match(norm)
             if m:
                 rest = norm[m.end():].strip()
-                if rest:  # 「氏名：山田太郎」→ 後ろを隠す
+                if rest and not _is_ui(rest):  # 「氏名：山田太郎」→ 後ろを隠す
                     a, _ = _span_back(idx, m.end(), m.end() + 1, len(ln.text))
                     hits.append(Hit(f"「{m.group(1)}」欄", ln.text[a:], ln.sub_box(a, len(ln.text))))
-                else:  # 見出しだけの行 → 右か下の欄を探す
+                elif not rest:  # 見出しだけの行 → 右か下の欄を探す
+                    label_only.append(ln)
+            else:
+                m = HEADER_ONLY_RE.match(norm)
+                if m and not norm[m.end():].strip():
                     label_only.append(ln)
 
         if words:
             hits.extend(_custom_hits(ln, words))
 
+    cells = [c for ln in lines for c in _segments(ln)]
+    if "name" in cats:
+        hits.extend(Hit("人の名前", c.text, c.box) for c in cells if _name_like(c.text) == 2)
+        col_cells, bands = _name_columns(cells)
+        hits.extend(Hit("人の名前（名前の列）", c.text, c.box) for c in col_cells if _name_like(c.text) != 2)
+        hits.extend(Hit("人の名前（名前の列）", "（列全体）", b) for b in bands)
+
     # 見出しだけの行のまわりを隠す
     #  ・表の列見出し（下に同じ列の行が続く）→ その列を下までまとめて隠す
     #  ・フォームの見出し → 同じ行の右側の欄（なければ真下の欄）を隠す
     def is_label(ln):
-        return bool(LABEL_RE.match(_normalize(ln.text)[0]))
+        n = _normalize(ln.text)[0]
+        return bool(LABEL_RE.match(n) or HEADER_ONLY_RE.match(n))
 
     for lab in label_only:
         lx1, ly1, lx2, ly2 = lab.box
         lh = max(ly2 - ly1, 8)
-        name = LABEL_RE.match(_normalize(lab.text)[0]).group(1)
+        nl = _normalize(lab.text)[0]
+        m = LABEL_RE.match(nl) or HEADER_ONLY_RE.match(nl)
+        name = m.group(1)
 
-        # 表の列: 見出しと左端がそろって、すき間なく下に並ぶ行
-        col, bottom = [], ly2
-        for ln in sorted((l for l in lines if l.box[1] >= ly2 - 2), key=lambda l: l.box[1]):
-            x1, y1, x2, y2 = ln.box
-            if abs(x1 - lx1) > lh * 1.5 or ln is lab:
-                continue
-            if y1 - bottom > lh * 2.5 or is_label(ln):
-                break
-            col.append(ln)
-            bottom = y2
-        # 表の見出し行なら、同じ高さの右側に他の見出しが3つ以上並んでいる
-        row_mates = sum(1 for l in lines if l is not lab and l.box[0] > lx2
+        # 表の見出し行なら、同じ高さに他の見出しが3つ以上並んでいる
+        row = [lab] + [c for c in cells if c.box[1] < ly2 and c.box[3] > ly1 and not (c.box[2] > lx1 and c.box[0] < lx2)
+                       and abs((c.box[1] + c.box[3]) / 2 - (ly1 + ly2) / 2) <= lh * 0.6]
+        row_mates = sum(1 for l in lines if l is not lab and l.box[1] < ly2 and l.box[3] > ly1
                         and abs((l.box[1] + l.box[3]) / 2 - (ly1 + ly2) / 2) <= lh * 0.6)
+        col = [c for c in _column_below(lab, cells, row, is_label) if _fits_header(name, c.text)]
         if name in COLUMN_HEADERS and len(col) >= 2 and row_mates >= 3:
             hits.extend(Hit(f"「{name}」列", ln.text, ln.box) for ln in col)
+            bx1, _, bx2, by2 = _band(col)
+            hits.append(Hit(f"「{name}」列", "（列全体）", (bx1, ly2 + 4, bx2, by2)))  # 見出しのすぐ下から
+            continue
+        if name in COLUMN_ONLY:
             continue
 
-        # フォーム: 同じ行（見出しの高さ±1行）で右にある欄
+        # フォーム: 同じ行（見出しの高さ±1行）で右にある欄（「必須」などの印は除く）
         cy = (ly1 + ly2) / 2
         right = [ln for ln in lines if ln is not lab
                  and ln.box[0] >= lx2 - 4 and ln.box[0] - lx2 < lh * 12
@@ -297,16 +491,28 @@ def detect(lines: list[Line], cats: set[str], words: list[str]) -> list[Hit]:
             ys2 = [ln.box[3] for ln in right] + [ly2 + lh // 2]
             hits.append(Hit(f"「{name}」欄", "（パスワード欄）", (lx2 + lh // 2, min(ys1), max(xs), max(ys2))))
             continue
+        right = [ln for ln in right if not _is_ui(ln.text)]
         if right:
             hits.extend(Hit(f"「{name}」欄", ln.text, ln.box) for ln in right)
             continue
         below = [ln for ln in lines if ln is not lab
                  and min(lx2, ln.box[2]) - max(lx1, ln.box[0]) > 0
                  and 0 <= ln.box[1] - ly2 + 2 < lh * 1.5]
-        if below and not is_label(below[0]):
+        if below and not is_label(below[0]) and not _is_ui(below[0].text) \
+                and not any(w in _normalize(below[0].text)[0] for w in ("メール", "アドレス", "名", "住所", "電話", "番号")):
             hits.append(Hit(f"「{name}」欄", below[0].text, below[0].box))
 
     return hits
+
+
+def _worth_learning(h: Hit) -> bool:
+    """動画全体で探し直す価値がある文字か（「必須」「署名」のような普通の言葉は覚えない）"""
+    t = re.sub(r"\s+", "", unicodedata.normalize("NFKC", h.text))
+    if len(t) < 2 or _is_ui(t) or h.text.startswith("（"):
+        return False
+    if h.category.startswith(("「", "人の名前（")):  # 欄・列の中身は、名前・番号・メールらしいものだけ
+        return bool(_name_like(t) or "@" in t or len(re.findall(r"\d", t)) >= 4)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +523,8 @@ def detect(lines: list[Line], cats: set[str], words: list[str]) -> list[Hit]:
 def apply_masks(frame, boxes, style="fill", pad=4):
     h, w = frame.shape[:2]
     for (x1, y1, x2, y2) in boxes:
-        x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
-        x2, y2 = min(w, x2 + pad), min(h, y2 + pad)
+        x1, y1 = max(0, int(x1) - pad), max(0, int(y1) - pad)
+        x2, y2 = min(w, int(x2) + pad), min(h, int(y2) + pad)
         if x2 <= x1 or y2 <= y1:
             continue
         if style == "mosaic":
@@ -343,7 +549,7 @@ def _hide(text: str) -> str:
 # 4. 画像 / 動画の処理
 # ---------------------------------------------------------------------------
 
-DEFAULT_CATS = {"email", "phone", "postal", "card", "address", "honorific", "label"}
+DEFAULT_CATS = {"email", "phone", "postal", "card", "address", "honorific", "name", "label"}
 
 
 def process_image(src, dst, cats=DEFAULT_CATS, words=(), style="fill", fixed_boxes=(), **_):
@@ -394,7 +600,7 @@ def process_video(src, dst, cats=DEFAULT_CATS, words=(), style="fill", interval=
     # （スクロールで見出しが画面外に出た後の名前、なども取りこぼさない）
     progress(0.8, "判定中…")
     first = {f: detect(ls, set(cats), list(words)) for f, ls in ocr_lines.items()}
-    learned = {re.sub(r"\s+", "", h.text) for hs in first.values() for h in hs}
+    learned = {re.sub(r"\s+", "", h.text) for hs in first.values() for h in hs if _worth_learning(h)}
     learned = [t for t in learned if len(t) >= 2]
     ocr_frames: dict[int, list[Hit]] = {}
     for f, ls in ocr_lines.items():
